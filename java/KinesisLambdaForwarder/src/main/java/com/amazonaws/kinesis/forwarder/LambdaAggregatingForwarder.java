@@ -27,6 +27,9 @@ import com.amazonaws.kinesis.agg.RecordAggregator;
 import com.amazonaws.kinesis.deagg.RecordDeaggregator;
 import com.amazonaws.regions.Region;
 import com.amazonaws.regions.Regions;
+import com.amazonaws.services.cloudwatch.AmazonCloudWatch;
+import com.amazonaws.services.cloudwatch.AmazonCloudWatchClientBuilder;
+import com.amazonaws.services.cloudwatch.model.*;
 import com.amazonaws.services.kinesis.AmazonKinesis;
 import com.amazonaws.services.kinesis.AmazonKinesisClient;
 import com.amazonaws.services.kinesis.clientlibrary.types.UserRecord;
@@ -36,6 +39,7 @@ import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.LambdaLogger;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
 import com.amazonaws.services.lambda.runtime.events.KinesisEvent;
+import org.apache.log4j.Logger;
 
 /**
  * A sample AWS Lambda function to receive records from one Kinesis stream, aggregate
@@ -44,15 +48,20 @@ import com.amazonaws.services.lambda.runtime.events.KinesisEvent;
 public class LambdaAggregatingForwarder implements RequestHandler<KinesisEvent, Void>
 {
     //Change these values to specify the information about your destination stream
-    private static final String DESTINATION_STREAM_NAME = "MyDestinationStream";
-    private static final Regions DESTINATION_STREAM_REGION = Regions.US_EAST_1;
-    
+    private static final String DESTINATION_STREAM_NAME = "MQTTStream2";
+    private static final Regions DESTINATION_STREAM_REGION = Regions.US_WEST_2;
+
     //Default values for Kinesis client to the destination stream (tune these to your use case)
     private static final int DESTINATION_CONNECTION_TIMEOUT = 10000;
     private static final int DESTINATION_SOCKET_TIMEOUT = 60000;
-    
+
     private final AmazonKinesis kinesisForwarder;
     private final RecordAggregator aggregator;
+
+    static final Logger log = Logger.getLogger(LambdaAggregatingForwarder.class);
+
+    final AmazonCloudWatch cw =
+            AmazonCloudWatchClientBuilder.defaultClient();
 
     /**
      * One-time initialization of resources for this Lambda function.
@@ -60,6 +69,7 @@ public class LambdaAggregatingForwarder implements RequestHandler<KinesisEvent, 
     public LambdaAggregatingForwarder()
     {
         this.aggregator = new RecordAggregator();
+        log.info("Initializing......");
         
         /*
          * If the Kinesis stream you're forwarding to is in the same account as this AWS Lambda function, you can just give the IAM Role executing
@@ -72,22 +82,23 @@ public class LambdaAggregatingForwarder implements RequestHandler<KinesisEvent, 
          */
         AWSCredentialsProvider provider = new DefaultAWSCredentialsProviderChain();
         //AWSCredentialsProvider provider = new STSAssumeRoleSessionCredentialsProvider(new DefaultAWSCredentialsProviderChain(), "<RoleToAssumeARN>", "KinesisForwarder");
-        
+
         //Set max conns to 1 since we use this client serially
         ClientConfiguration kinesisConfig = new ClientConfiguration();
         kinesisConfig.setMaxConnections(1);
         kinesisConfig.setProtocol(Protocol.HTTPS);
         kinesisConfig.setConnectionTimeout(DESTINATION_CONNECTION_TIMEOUT);
         kinesisConfig.setSocketTimeout(DESTINATION_SOCKET_TIMEOUT);
-        
+
         this.kinesisForwarder = new AmazonKinesisClient(provider, kinesisConfig);
         this.kinesisForwarder.setRegion(Region.getRegion(DESTINATION_STREAM_REGION));
+
     }
-    
+
     /**
      * Check if the input aggregated record is complete and if so, forward it to the
      * configured destination Kinesis stream.
-     * 
+     *
      * @param logger The LambdaLogger from the input Context
      * @param aggRecord The aggregated record to transmit or null if the record isn't full yet.
      */
@@ -97,9 +108,9 @@ public class LambdaAggregatingForwarder implements RequestHandler<KinesisEvent, 
         {
             return;
         }
-        
+
         logger.log("Forwarding " + aggRecord.getNumUserRecords() + " as an aggregated record.");
-        
+
         PutRecordRequest request = aggRecord.toPutRecordRequest(DESTINATION_STREAM_NAME);
         try
         {
@@ -112,33 +123,60 @@ public class LambdaAggregatingForwarder implements RequestHandler<KinesisEvent, 
             return;
         }
     }
-    
+
     public Void handleRequest(KinesisEvent input, Context context)
     {
         LambdaLogger logger = context.getLogger();
         logger.log("Received " + input.getRecords().size() + " raw Kinesis records.");
-        
+
         try
         {
             //Allows us to receive and process Kinesis aggregated records, but can also process normal
             //non-aggregated records without an issue (deaggregation is a no-op in the latter scenario)
             List<UserRecord> userRecords = RecordDeaggregator.deaggregate(input.getRecords());
-            
+
             logger.log("Received " + userRecords.size() + " deaggregated Kinesis records.");
-            
-            for (UserRecord userRecord : userRecords) 
+            int numRecordsForMetric = userRecords.size();
+
+            for (UserRecord userRecord : userRecords)
             {
-                AggRecord aggRecord = this.aggregator.addUserRecord(userRecord);
-                checkAndForwardRecords(logger, aggRecord);
+//                AggRecord aggRecord = this.aggregator.addUserRecord(userRecord);
+//                checkAndForwardRecords(logger, aggRecord);
+                String message = new String(userRecord.getData().array());
+                String[] arr = message.split("~@~");
+                logger.log("Aggregated record Topic:" + arr[0]);
+                if (arr[0].indexOf("HealthCheckUser") != -1) {
+                    logger.log("Removing healthcheckUser From Count");
+                    numRecordsForMetric--;
+                }
             }
-            
-            checkAndForwardRecords(logger, this.aggregator.clearAndGet());
-        } 
-        catch (Exception e) 
+            sendCWStats(numRecordsForMetric);
+            //checkAndForwardRecords(logger, this.aggregator.clearAndGet());
+        }
+        catch (Exception e)
         {
             logger.log("Lambda function encountered fatal error: " + e.getMessage());
         }
 
         return null;
+    }
+
+    private void sendCWStats(int numRecords) {
+        Dimension dimension = new Dimension()
+                .withName("FunctionName")
+                .withValue("KinesisLambda");
+
+        MetricDatum datum = new MetricDatum()
+                .withMetricName("NumRecords")
+                .withUnit(StandardUnit.Count)
+                .withValue((double)numRecords)
+                .withDimensions(dimension);
+
+        PutMetricDataRequest request = new PutMetricDataRequest()
+                .withNamespace("AAHealth/KinesisConsumer")
+                .withMetricData(datum);
+
+        PutMetricDataResult response = cw.putMetricData(request);
+        log.info("metric put response: " + response.toString());
     }
 }
